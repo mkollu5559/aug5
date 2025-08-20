@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+# change-verify-gitlab.py
+
+# Internal FR - Source Code
+
+import urllib.request
+import urllib.parse
+import base64
+import json
+import os
+import sys
+import ssl
+import urllib.error
+from datetime import datetime, timezone, timedelta
+
+# ---- TZ support for Python 3.8 (no stdlib zoneinfo) ----
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    EASTERN_TZ = ZoneInfo("America/New_York")
+except Exception:
+    try:
+        from dateutil import tz  # commonly available with python-dateutil
+        EASTERN_TZ = tz.gettz("America/New_York")
+    except Exception:
+        # Fallback (no DST awareness). Prefer to have dateutil installed.
+        class _FixedEST(timezone.__class__):
+            pass
+        EASTERN_TZ = timezone(timedelta(hours=-5))  # EST fixed offset
+
+# ----------------- CONFIGURATION -----------------
+
+INSTANCE_URL = os.getenv(
+    "SERVICENOW_INSTANCE_URL",
+    "https://frs.servicenowservices.com/api/now/table/change_request",
+)
+
+# Ticket Number and Expected Values
+TICKET_NUMBER = os.getenv("TICKET_REF", "").strip()
+EXPECTED_ASSIGNED_GROUP = os.getenv("SERVICENOW_EXPECTED_GROUP", "P1G-SN-NIS-EF")
+
+# support multiple expected states via comma list (kept as in your code)
+EXPECTED_STATE = [s.strip() for s in os.getenv(
+    "SERVICENOW_EXPECTED_STATE", "Scheduled, Implement, Review"
+).split(",")]
+
+# Auth
+USERNAME = os.getenv("SERVICENOW_USER", "")
+PASSWORD = os.getenv("SERVICENOW_PASSWORD", "")
+
+if not TICKET_NUMBER:
+    print("❌ Environment variable TICKET_REF is required.")
+    sys.exit(1)
+if not USERNAME or not PASSWORD:
+    print("❌ Missing ServiceNow credentials.")
+    sys.exit(1)
+
+# ----------------- BUILD REQUEST -----------------
+
+fields = [
+    "number",
+    "type",  # (ADDED) used only to decide if we skip checks for non-normal
+    "state",
+    "assignment_group",
+    "start_date",
+    "end_date",
+]
+sysparm_fields = ",".join(fields)
+
+query_params = {
+    "sysparm_query": f"number={TICKET_NUMBER}",
+    "sysparm_display_value": "true",
+    "sysparm_limit": "1",
+    "sysparm_fields": sysparm_fields,
+}
+api_url = f"{INSTANCE_URL}?{urllib.parse.urlencode(query_params)}"
+
+req = urllib.request.Request(api_url)
+req.add_header("Accept", "application/json")
+auth = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode("utf-8")).decode("utf-8")
+req.add_header("Authorization", f"Basic {auth}")
+
+# ----------------- CALL API -----------------
+
+try:
+    with urllib.request.urlopen(req) as resp:
+        if resp.status != 200:
+            print(f"❌ Received HTTP status {resp.status}")
+            sys.exit(1)
+        result_json = json.loads(resp.read().decode("utf-8"))
+except urllib.error.HTTPError as e:
+    print(f"❌ HTTP error occurred: {e}")
+    sys.exit(1)
+except urllib.error.URLError as e:
+    print(f"❌ URL error occurred: {e}")
+    sys.exit(1)
+
+# ----------------- PARSE -----------------
+
+if "result" not in result_json or not result_json["result"]:
+    print(f"❌ No results found for ticket {TICKET_NUMBER}")
+    sys.exit(1)
+
+ticket = result_json["result"][0]
+
+# ---- TYPE GATE: print type, skip all checks for non-normal (passes pipeline) ----
+ticket_type = (ticket.get("type") or "").strip().lower()
+if ticket_type != "normal":
+    print(f"✅ Ticket {TICKET_NUMBER} is type='{ticket_type or 'unknown'}' → skipping all checks and passing pipeline.")
+    sys.exit(0)
+
+# ----------------- EXISTING FIELDS -----------------
+
+ticket_number = ticket.get("number", "")
+assignment_group = ticket.get("assignment_group", {})
+state = (ticket.get("state") or "").strip()
+start_date_data = (ticket.get("start_date") or "").strip()
+end_date_data = (ticket.get("end_date") or "").strip()
+assigned_group_display = (assignment_group or {}).get("display_value", "")
+
+# ----------------- VALIDATIONS -----------------
+
+print(f"Ticket {TICKET_NUMBER} found (Type: {ticket_type}).")
+
+# 1) State check (multiple allowed)
+if state.lower() in [s.lower() for s in EXPECTED_STATE]:
+    print(f"✅ Ticket {TICKET_NUMBER} IN expected state {EXPECTED_STATE} (Current state: {state}).")
+else:
+    print(f"❌ Ticket {TICKET_NUMBER} is NOT in EXPECTED_STATE {EXPECTED_STATE} (Current state: {state}).")
+    sys.exit(1)
+
+# 2) Assignment group check
+if assigned_group_display.lower() == EXPECTED_ASSIGNED_GROUP.lower():
+    print(f"✅ Ticket {TICKET_NUMBER} is assigned to EXPECTED_ASSIGNED_GROUP ({assigned_group_display}).")
+else:
+    print(f"❌ Ticket {TICKET_NUMBER} is NOT assigned to EXPECTED_ASSIGNED_GROUP ({EXPECTED_ASSIGNED_GROUP}) "
+          f"(Current assigned: {assigned_group_display}).")
+    sys.exit(1)
+
+# 3) Scheduled window check in **US/Eastern** (Python 3.8 compatible)
+try:
+    # Adjust format if your instance uses a different one
+    start_date = datetime.strptime(start_date_data, "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=EASTERN_TZ)
+    end_date   = datetime.strptime(end_date_data,   "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=EASTERN_TZ)
+    now = datetime.now(EASTERN_TZ)
+    if start_date <= now <= end_date:
+        print(f"✅ Schedule OK for now (Eastern): {now}")
+    else:
+        print(f"❌ Scheduled window mismatch for ticket {TICKET_NUMBER}: "
+              f"from {start_date} to {end_date}, now is {now}")
+        sys.exit(1)
+except Exception as e:
+    print(f"❌ Error parsing scheduled dates: {e}")
+    sys.exit(1)
+
+sys.exit(0)
